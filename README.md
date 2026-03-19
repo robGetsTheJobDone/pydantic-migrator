@@ -1,17 +1,15 @@
 # pydantic-migrator
 
-`pydantic-migrator` is a small library scaffold for versioned Pydantic model migrations.
+`pydantic-migrator` is a focused library for versioned Pydantic model migrations.
 
-The design is intentionally narrow:
+It keeps the migration model explicit and strict:
 
-- Model identity is explicit: every versioned model declares a schema name and version.
-- Adjacent migrations are the source of truth.
-- Multi-hop upgrades and downgrades are planned by composing adjacent migrations.
-- Generated migration files are stubs on purpose. Humans fill in the domain transformation logic.
+- every versioned model declares a schema name and version
+- migrations are registered for adjacent versions only
+- multi-hop upgrades and downgrades are planned by composing those adjacent edges
+- generated stubs intentionally stop at `NotImplementedError` because domain transforms still need human logic
 
-## Status
-
-This is an initial scaffold, not a full migration framework. Generated stubs raise `NotImplementedError` until you implement them.
+This is meant to be usable as-is for teams that want boring, auditable schema evolution instead of magic inference.
 
 ## Install
 
@@ -21,56 +19,199 @@ pip install -e .
 pip install -e ".[dev]"
 ```
 
-## Core Concepts
+## Workflow
 
-### Versioned models
+### 1. Define versioned models
+
+Real schema evolution usually involves nested models and typed collections, not just field renames.
 
 ```python
+from pydantic import BaseModel, Field
+
 from pydantic_migrator import VersionedModel, versioned_model
 
 
-@versioned_model("customer", 1)
-class CustomerV1(VersionedModel):
+class CustomerSnapshotV1(BaseModel):
     full_name: str
+    email: str
 
 
-@versioned_model("customer", 2)
-class CustomerV2(VersionedModel):
+class LineItemV1(BaseModel):
+    sku: str
+    quantity: int
+    unit_price_cents: int
+
+
+@versioned_model("order", 1)
+class OrderV1(VersionedModel):
+    legacy_order_id: str
+    customer: CustomerSnapshotV1
+    items: list[LineItemV1]
+    notes: list[str] = Field(default_factory=list)
+
+
+class CustomerNameV2(BaseModel):
     given_name: str
     family_name: str
+
+
+class MoneyV2(BaseModel):
+    amount_minor: int
+    currency: str
+
+
+class CustomerProfileV2(BaseModel):
+    name: CustomerNameV2
+    primary_email: str
+    segment: str
+
+
+class LineItemV2(BaseModel):
+    sku: str
+    quantity: int
+    unit_price: MoneyV2
+
+
+@versioned_model("order", 2)
+class OrderV2(VersionedModel):
+    order_id: str
+    customer: CustomerProfileV2
+    items: list[LineItemV2]
+    status: str
+    notes: list[str] = Field(default_factory=list)
 ```
 
-### Adjacent migrations
+The full example in [`examples/versioned_models.py`](examples/versioned_models.py) continues this schema family through `OrderV3`.
 
-You register migrations for neighboring versions only. The library plans longer paths by composing them.
+### 2. Define adjacent migrations
+
+Use model-driven decorators so the edge definition stays coupled to the typed source and target models.
 
 ```python
-from pydantic_migrator import build_registry, define_migration
+from pydantic_migrator import define_migration
 
 
-@define_migration(from_model=CustomerV1, to_model=CustomerV2)
-def migrate_customer_v1_to_v2(model: CustomerV1) -> CustomerV2:
-    parts = model.full_name.split(maxsplit=1)
-    return CustomerV2(
-        given_name=parts[0],
-        family_name=parts[1] if len(parts) > 1 else "",
+def split_full_name(full_name: str) -> tuple[str, str]:
+    given_name, _, family_name = full_name.partition(" ")
+    return given_name, family_name
+
+
+@define_migration(from_model=OrderV1, to_model=OrderV2)
+def migrate_order_v1_to_v2(model: OrderV1) -> OrderV2:
+    given_name, family_name = split_full_name(model.customer.full_name)
+    return OrderV2(
+        order_id=model.legacy_order_id,
+        customer=CustomerProfileV2(
+            name=CustomerNameV2(
+                given_name=given_name,
+                family_name=family_name,
+            ),
+            primary_email=model.customer.email,
+            segment="standard",
+        ),
+        items=[
+            LineItemV2(
+                sku=item.sku,
+                quantity=item.quantity,
+                unit_price=MoneyV2(amount_minor=item.unit_price_cents, currency="USD"),
+            )
+            for item in model.items
+        ],
+        status="pending",
+        notes=list(model.notes),
     )
+```
+
+The explicit edge form still works when needed:
+
+```python
+@define_migration(schema_name="order", from_version=1, to_version=2)
+def migrate_order_v1_to_v2(model: OrderV1) -> OrderV2:
+    ...
+```
+
+### 3. Build a registry, plan paths, and migrate models
+
+```python
+from pydantic_migrator import MigrationPlanner, build_registry, migrate
 
 
 registry = build_registry(
-    CustomerV1,
-    CustomerV2,
-    migrate_customer_v1_to_v2,
+    OrderV1,
+    OrderV2,
+    OrderV3,
+    migrate_order_v1_to_v2,
+    migrate_order_v2_to_v3,
+    migrate_order_v3_to_v2,
+    migrate_order_v2_to_v1,
+)
+
+plan = MigrationPlanner(registry).plan("order", 1, 3)
+assert [(step.from_version, step.to_version) for step in plan.steps] == [(1, 2), (2, 3)]
+
+order_v3 = migrate(order_v1, target_version=3, registry=registry)
+```
+
+### 4. Scaffold a new schema family and bump versions
+
+For a new schema family, start with the scaffolded package layout:
+
+```bash
+pydantic-migrator create order --path src/myapp/schemas
+```
+
+That creates:
+
+- `src/myapp/schemas/order/__init__.py`
+- `src/myapp/schemas/order/registry.py`
+- `src/myapp/schemas/order/models/__init__.py`
+- `src/myapp/schemas/order/models/v1.py`
+- `src/myapp/schemas/order/migrations/__init__.py`
+- `src/myapp/schemas/order/tests/__init__.py`
+- `src/myapp/schemas/order/tests/test_order_migrations.py`
+
+`--path` must point at an existing importable package directory. In the example above, `src/myapp/schemas/__init__.py` should already exist, and `--pythonpath src` makes the family importable as `myapp.schemas.order`.
+
+When you are ready for the next version:
+
+```bash
+pydantic-migrator bump myapp.schemas.order --pythonpath src
+```
+
+By default `bump` writes:
+
+- `models/v2.py`
+- `migrations/order_v1_to_v2.py`
+- `migrations/order_v2_to_v1.py`
+
+Those migration files are intentionally generated as typed stubs with `TODO` markers and `NotImplementedError` placeholders. The library can scaffold the edge and the imports, but only the application owner can supply the business transformation logic.
+
+You can also generate stubs directly:
+
+```python
+from pathlib import Path
+
+from examples.versioned_models import OrderV1, OrderV2, registry
+from pydantic_migrator import (
+    generate_bidirectional_migration_stubs,
+    generate_missing_adjacent_migration_stubs,
+)
+
+
+generate_bidirectional_migration_stubs(
+    Path("migrations"),
+    older_model=OrderV1,
+    newer_model=OrderV2,
+)
+
+generate_missing_adjacent_migration_stubs(
+    Path("migrations"),
+    registry=registry,
+    schema_name="order",
 )
 ```
 
-The preferred declaration is model-driven. The explicit edge form still works when needed:
-
-```python
-@define_migration(schema_name="customer", from_version=1, to_version=2)
-def migrate_customer_v1_to_v2(model: CustomerV1) -> CustomerV2:
-    ...
-```
+## Strictness
 
 Migrations are validated strictly:
 
@@ -80,129 +221,28 @@ Migrations are validated strictly:
 - typed annotations must agree with the declaration
 - runtime return values must match the target model type when it is known
 
-### Planning multi-hop upgrades or downgrades
-
-```python
-from pydantic_migrator import MigrationPlanner
-
-
-planner = MigrationPlanner(registry)
-plan = planner.plan("customer", 1, 3)
-
-for step in plan.steps:
-    print(step.from_version, "->", step.to_version)
-```
-
-If a caller wants `v3 -> v1`, the planner walks the registered adjacent downgrade migrations in reverse order.
-
-### Missing migration detection
-
-```python
-from pydantic_migrator import find_missing_adjacent_migrations
-
-
-missing = find_missing_adjacent_migrations(registry, schema_name="customer")
-for edge in missing:
-    print(edge.from_version, "->", edge.to_version)
-```
-
-## Stub Generation
-
-For a new schema family, start with the scaffolded package layout:
-
-```bash
-pydantic-migrator create customer --path src/myapp/schemas
-```
-
-That creates:
-
-- `src/myapp/schemas/customer/__init__.py`
-- `src/myapp/schemas/customer/registry.py`
-- `src/myapp/schemas/customer/models/__init__.py`
-- `src/myapp/schemas/customer/models/v1.py`
-- `src/myapp/schemas/customer/migrations/__init__.py`
-- `src/myapp/schemas/customer/tests/__init__.py`
-- `src/myapp/schemas/customer/tests/test_customer_migrations.py`
-
-`--path` must point at an existing importable package directory. In the example above, `src/myapp/schemas/__init__.py` should already exist, and `--pythonpath src` makes the family importable as `myapp.schemas.customer`.
-
-Then add the next version and adjacent migration stubs:
-
-```bash
-pydantic-migrator bump myapp.schemas.customer --pythonpath src
-```
-
-By default `bump` writes:
-
-- `models/v2.py`
-- `migrations/customer_v1_to_v2.py`
-- `migrations/customer_v2_to_v1.py`
-
-The generated family package stays importable through `myapp.schemas.customer`, and the scaffolded `registry.py` exposes a ready-to-use `registry` object built from that package's models and migrations.
-
-You can generate migration stubs for adjacent versions:
-
-```python
-from pathlib import Path
-
-from examples.versioned_models import CustomerV1, CustomerV2
-from pydantic_migrator import generate_bidirectional_migration_stubs
-
-
-generate_bidirectional_migration_stubs(
-    Path("migrations"),
-    older_model=CustomerV1,
-    newer_model=CustomerV2,
-)
-```
-
-Or generate every missing adjacent edge already implied by a registered schema family:
-
-```python
-from pydantic_migrator import generate_missing_adjacent_migration_stubs
-
-
-generate_missing_adjacent_migration_stubs(
-    Path("migrations"),
-    registry=registry,
-    schema_name="customer",
-)
-```
-
-That produces files like:
-
-- `customer_v1_to_v2.py`
-- `customer_v2_to_v1.py`
-
-Each generated file contains:
-
-- A `define_migration(...)` decorator
-- Typed source and target models
-- `TODO` markers where human transform logic belongs
-- An explicit `NotImplementedError` placeholder until the migration is written
+For scaffolded families, `check`, `generate`, and `bump` also fail fast if model versions are not contiguous. A family with `v1` and `v3` but no `v2` reports a clear `GAP ...` error instead of silently skipping the hole.
 
 ## CLI
 
-The CLI stays explicit. Point it at a module that defines your versioned models and decorated migrations.
+Point the CLI at a module or scaffolded family package that exposes your versioned models and decorated migrations.
 
 ```bash
-pydantic-migrator create customer --path src/myapp/schemas
-pydantic-migrator bump myapp.schemas.customer --pythonpath src
-pydantic-migrator check --module myapp.customer_migrations
-pydantic-migrator plan --module myapp.customer_migrations --schema customer --from-version 1 --to-version 3
-pydantic-migrator generate --module myapp.customer_migrations --schema customer --path migrations
+pydantic-migrator create order --path src/myapp/schemas
+pydantic-migrator bump myapp.schemas.order --pythonpath src
+pydantic-migrator check --module myapp.order_migrations
+pydantic-migrator plan --module myapp.order_migrations --schema order --from-version 1 --to-version 3
+pydantic-migrator generate --module myapp.order_migrations --schema order --path migrations
 ```
-
-For scaffolded families, `check`, `generate`, and `bump` fail fast if model versions are not contiguous. A family with `v1` and `v3` but no `v2` reports a clear `GAP ...` error instead of silently skipping the hole.
 
 The CLI accepts both the newer positional form and the older flag-based form for `create` and module-based commands such as `bump`. The positional form is preferred:
 
 ```bash
-pydantic-migrator create customer --path src/myapp/schemas
-pydantic-migrator create --schema customer --output-dir src/myapp/schemas
+pydantic-migrator create order --path src/myapp/schemas
+pydantic-migrator create --schema order --output-dir src/myapp/schemas
 
-pydantic-migrator bump myapp.schemas.customer --pythonpath src
-pydantic-migrator bump --module myapp.schemas.customer --pythonpath src
+pydantic-migrator bump myapp.schemas.order --pythonpath src
+pydantic-migrator bump --module myapp.schemas.order --pythonpath src
 ```
 
 ## Public API
@@ -222,7 +262,6 @@ pydantic-migrator bump --module myapp.schemas.customer --pythonpath src
 - `generate_bidirectional_migration_stubs(...)`
 - `generate_missing_adjacent_migration_stubs(...)`
 
-## Example Layout
+## Example
 
-- [`examples/versioned_models.py`](examples/versioned_models.py) contains `CustomerV1`, `CustomerV2`, and `CustomerV3`.
-- Tests cover planning, DX helpers, and stub generation and can be run with `pytest`.
+[`examples/versioned_models.py`](examples/versioned_models.py) contains a realistic `OrderV1` -> `OrderV2` -> `OrderV3` evolution story with nested models, list fields, adjacent migrations, a registry, and helper functions for planning and migrating.
