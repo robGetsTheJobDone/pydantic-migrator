@@ -1,27 +1,86 @@
 # pydantic-migrator
 
-`pydantic-migrator` is a focused library for versioned Pydantic model migrations.
+`pydantic-migrator` is a strict, DX-focused library for versioned Pydantic model migrations.
 
-It keeps the migration model explicit and strict:
+The happy path is simple:
 
-- every versioned model declares a schema name and version
-- migrations are registered for adjacent versions only
-- multi-hop upgrades and downgrades are planned by composing those adjacent edges
-- generated stubs intentionally stop at `NotImplementedError` because domain transforms still need human logic
+1. annotate versioned models
+2. annotate adjacent migrations
+3. build a registry
+4. migrate any reachable version by composing adjacent edges
+5. scaffold new schema families and bump versions from the CLI
 
-This is meant to be usable as-is for teams that want boring, auditable schema evolution instead of magic inference.
+It is intentionally strict:
+
+- every versioned model has an explicit schema name and version
+- migrations are adjacent-only
+- upgrades and downgrades are composed from those adjacent edges
+- generated migration stubs intentionally contain `NotImplementedError` until you write the domain logic
+
+This is built for boring, auditable schema evolution rather than inference magic.
+
+## Quickstart
+
+### Python API
+
+```python
+from pydantic import BaseModel
+from pydantic_migrator import VersionedModel, build_registry, define_migration, migrate, versioned_model
+
+
+@versioned_model("customer", 1)
+class CustomerV1(VersionedModel):
+    full_name: str
+
+
+@versioned_model("customer", 2)
+class CustomerV2(VersionedModel):
+    given_name: str
+    family_name: str
+
+
+@define_migration(from_model=CustomerV1, to_model=CustomerV2)
+def customer_v1_to_v2(model: CustomerV1) -> CustomerV2:
+    given_name, _, family_name = model.full_name.partition(" ")
+    return CustomerV2(given_name=given_name, family_name=family_name)
+
+
+@define_migration(from_model=CustomerV2, to_model=CustomerV1)
+def customer_v2_to_v1(model: CustomerV2) -> CustomerV1:
+    return CustomerV1(full_name=f"{model.given_name} {model.family_name}".strip())
+
+
+registry = build_registry(CustomerV1, CustomerV2, customer_v1_to_v2, customer_v2_to_v1)
+
+customer_v2 = migrate(CustomerV1(full_name="Ada Lovelace"), target_version=2, registry=registry)
+```
+
+### CLI
+
+```bash
+pydantic-migrator create customer --path src/myapp/schemas
+pydantic-migrator bump myapp.schemas.customer --pythonpath src
+pydantic-migrator check --module myapp.schemas.customer
+```
 
 ## Install
 
 ```bash
-pip install -e .
-# or, for development:
-pip install -e ".[dev]"
+python -m pip install -e .
 ```
 
-## Workflow
+For local development and CI parity:
 
-### 1. Define versioned models
+```bash
+python -m pip install -e ".[dev]"
+python -m pytest
+```
+
+`pydantic-migrator` currently requires Python 3.11+.
+
+## DX-first workflow
+
+### 1. Define versioned models with annotations
 
 Real schema evolution usually involves nested models and typed collections, not just field renames.
 
@@ -83,9 +142,9 @@ class OrderV2(VersionedModel):
 
 The full example in [`examples/versioned_models.py`](examples/versioned_models.py) continues this schema family through `OrderV3`.
 
-### 2. Define adjacent migrations
+### 2. Define adjacent migrations with annotations
 
-Use model-driven decorators so the edge definition stays coupled to the typed source and target models.
+Use model-driven decorators so the migration edge stays coupled to the typed source and target models.
 
 ```python
 from pydantic_migrator import define_migration
@@ -152,7 +211,7 @@ assert [(step.from_version, step.to_version) for step in plan.steps] == [(1, 2),
 order_v3 = migrate(order_v1, target_version=3, registry=registry)
 ```
 
-### 4. Scaffold a new schema family and bump versions
+### 4. Scaffold a new schema family and bump versions fast
 
 For a new schema family, start with the scaffolded package layout:
 
