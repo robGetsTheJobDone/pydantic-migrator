@@ -108,6 +108,38 @@ for edge in missing:
 
 ## Stub Generation
 
+For a new schema family, start with the scaffolded package layout:
+
+```bash
+pydantic-migrator create customer --path src/myapp/schemas
+```
+
+That creates:
+
+- `src/myapp/schemas/customer/__init__.py`
+- `src/myapp/schemas/customer/registry.py`
+- `src/myapp/schemas/customer/models/__init__.py`
+- `src/myapp/schemas/customer/models/v1.py`
+- `src/myapp/schemas/customer/migrations/__init__.py`
+- `src/myapp/schemas/customer/tests/__init__.py`
+- `src/myapp/schemas/customer/tests/test_customer_migrations.py`
+
+`--path` must point at an existing importable package directory. In the example above, `src/myapp/schemas/__init__.py` should already exist, and `--pythonpath src` makes the family importable as `myapp.schemas.customer`.
+
+Then add the next version and adjacent migration stubs:
+
+```bash
+pydantic-migrator bump myapp.schemas.customer --pythonpath src
+```
+
+By default `bump` writes:
+
+- `models/v2.py`
+- `migrations/customer_v1_to_v2.py`
+- `migrations/customer_v2_to_v1.py`
+
+The generated family package stays importable through `myapp.schemas.customer`, and the scaffolded `registry.py` exposes a ready-to-use `registry` object built from that package's models and migrations.
+
 You can generate migration stubs for adjacent versions:
 
 ```python
@@ -154,9 +186,23 @@ Each generated file contains:
 The CLI stays explicit. Point it at a module that defines your versioned models and decorated migrations.
 
 ```bash
+pydantic-migrator create customer --path src/myapp/schemas
+pydantic-migrator bump myapp.schemas.customer --pythonpath src
 pydantic-migrator check --module myapp.customer_migrations
 pydantic-migrator plan --module myapp.customer_migrations --schema customer --from-version 1 --to-version 3
-pydantic-migrator generate --module myapp.customer_migrations --schema customer --output-dir migrations
+pydantic-migrator generate --module myapp.customer_migrations --schema customer --path migrations
+```
+
+For scaffolded families, `check`, `generate`, and `bump` fail fast if model versions are not contiguous. A family with `v1` and `v3` but no `v2` reports a clear `GAP ...` error instead of silently skipping the hole.
+
+The CLI accepts both the newer positional form and the older flag-based form for `create` and module-based commands such as `bump`. The positional form is preferred:
+
+```bash
+pydantic-migrator create customer --path src/myapp/schemas
+pydantic-migrator create --schema customer --output-dir src/myapp/schemas
+
+pydantic-migrator bump myapp.schemas.customer --pythonpath src
+pydantic-migrator bump --module myapp.schemas.customer --pythonpath src
 ```
 
 ## Public API

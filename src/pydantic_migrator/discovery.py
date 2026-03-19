@@ -21,11 +21,33 @@ def build_registry_from_module(
     *,
     pythonpath: Iterable[str | Path] = (),
 ) -> MigrationRegistry:
-    with _temporary_pythonpath(pythonpath):
-        module = importlib.import_module(module_name)
+    module = import_module_with_pythonpath(module_name, pythonpath=pythonpath, reload=True)
 
     models, migrations = discover_module_items(module)
     return build_registry(*models, *migrations)
+
+
+def import_module_with_pythonpath(
+    module_name: str,
+    *,
+    pythonpath: Iterable[str | Path] = (),
+    reload: bool = False,
+) -> ModuleType:
+    normalized_pythonpath = _normalize_pythonpath(pythonpath)
+    with _temporary_pythonpath(normalized_pythonpath):
+        importlib.invalidate_caches()
+        try:
+            if reload:
+                _clear_module_cache(module_name)
+            return importlib.import_module(module_name)
+        except ModuleNotFoundError as exc:
+            if exc.name == module_name or module_name.startswith(f"{exc.name}."):
+                searched = ", ".join(str(path) for path in normalized_pythonpath) or "(none)"
+                raise ModuleNotFoundError(
+                    f"Could not import {module_name!r}. Searched with pythonpath {searched}. "
+                    "Pass --pythonpath to the directory that contains the top-level package."
+                ) from exc
+            raise
 
 
 def discover_module_items(
@@ -71,3 +93,19 @@ def _temporary_pythonpath(paths: Iterable[str | Path]) -> Iterator[None]:
                 sys.path.remove(path)
             except ValueError:
                 continue
+
+
+def _clear_module_cache(module_name: str) -> None:
+    module_prefix = f"{module_name}."
+    for loaded_module_name in tuple(sys.modules):
+        if loaded_module_name == module_name or loaded_module_name.startswith(module_prefix):
+            sys.modules.pop(loaded_module_name, None)
+
+
+def _normalize_pythonpath(paths: Iterable[str | Path]) -> tuple[Path, ...]:
+    normalized = tuple(Path(path) for path in paths)
+    missing = [path for path in normalized if not path.exists()]
+    if missing:
+        missing_paths = ", ".join(str(path) for path in missing)
+        raise ImportError(f"--pythonpath contains paths that do not exist: {missing_paths}")
+    return normalized

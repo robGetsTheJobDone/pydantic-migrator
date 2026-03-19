@@ -23,3 +23,7 @@ class MigrationPlanningError(PydanticMigratorError):
 
 class UnimplementedMigrationError(PydanticMigratorError):
     """Raised when a planned migration exists but has no executable transform."""
+
+
+class ScaffoldLayoutError(PydanticMigratorError):
+    """Raised when a scaffolded schema family is incomplete or inconsistent."""

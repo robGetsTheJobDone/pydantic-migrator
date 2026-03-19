@@ -6,6 +6,7 @@ from .exceptions import (
     MigrationRuntimeError,
     InvalidVersionedModelError,
     MigrationPlanningError,
+    ScaffoldLayoutError,
     UnimplementedMigrationError,
 )
 from .generator import (
@@ -30,6 +31,7 @@ __all__ = [
     "MigrationPlanningError",
     "MigrationRegistry",
     "MissingMigration",
+    "ScaffoldLayoutError",
     "SchemaVersion",
     "UnimplementedMigrationError",
     "VersionedModel",
